@@ -9,7 +9,7 @@ from garmin import (
 import sys
 
 # Number of days to export (default 30). Update this constant to change the range.
-DEFAULT_DAYS_BACK = 30
+DEFAULT_DAYS_BACK = 31
 
 
 def main():
