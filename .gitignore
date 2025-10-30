@@ -1,4 +1,6 @@
 garmin_export
+daily_summary.csv
+df_all.csv
 
 # Python-generated files
 __pycache__/
