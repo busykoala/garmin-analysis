@@ -4,6 +4,8 @@ This repo exports and dumps activity data from Garmin Connect.
 It create a `daily_summary.csv` file and a `df_all.csv` file with the health
 parameters as a time series.
 
+![Hero Image](./assets/garmin-hero.png)
+
 ## Installation
 
 `uv` is required to run the code.
