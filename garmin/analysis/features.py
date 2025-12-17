@@ -41,10 +41,12 @@ def compute_daily_metrics(df_ts: pd.DataFrame) -> pd.DataFrame:
         "steps_total": steps_sum,
         "active_minutes": grouped["steps_per_min"].agg(lambda s: (s.fillna(0) >= 30).sum()),
         "vigorous_minutes": grouped["steps_per_min"].agg(lambda s: (s.fillna(0) >= 100).sum()),
+        "moderate_minutes": grouped["steps_per_min"].agg(lambda s: ((s.fillna(0) >= 60) & (s.fillna(0) < 100)).sum()),
         "heart_rate_mean": grouped["heart_rate"].mean(),
         "heart_rate_min": grouped["heart_rate"].min(),
         "heart_rate_max": grouped["heart_rate"].max(),
         "stress_mean": grouped["stress_level"].mean(),
+        "stress_load": grouped["stress_level"].agg(lambda s: (s.fillna(0) - 25).clip(lower=0).sum(min_count=1)),
         "body_battery_am": grouped["body_battery"].apply(_first_valid),
         "body_battery_pm": grouped["body_battery"].apply(_last_valid),
         "sleep_minutes": sleep_minutes,
@@ -55,7 +57,7 @@ def compute_daily_metrics(df_ts: pd.DataFrame) -> pd.DataFrame:
 
     # If no step observations that day, treat steps and derived minutes as missing
     no_steps = steps_obs == 0
-    daily.loc[no_steps, ["steps_total", "active_minutes", "vigorous_minutes"]] = pd.NA
+    daily.loc[no_steps, ["steps_total", "active_minutes", "vigorous_minutes", "moderate_minutes"]] = pd.NA
 
     # Body battery delta only when both endpoints exist
     daily["body_battery_delta"] = daily["body_battery_pm"] - daily["body_battery_am"]

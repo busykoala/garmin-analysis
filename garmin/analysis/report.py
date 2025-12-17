@@ -3,14 +3,33 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
+from scipy import stats
 
 from .data import load_mood, load_timeseries
 from .features import aggregate_mood_daily, compute_daily_metrics, enrich_mood_events
 from .plots import generate_all_plots
 
 
-def _correlations(daily_metrics: pd.DataFrame, mood_daily: pd.DataFrame) -> Dict[str, float]:
+def _corr_stats(df: pd.DataFrame, cols: List[str], target: str = "mood_mean") -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for col in cols:
+        if col not in df.columns:
+            continue
+        x = pd.to_numeric(df[col], errors="coerce")
+        y = pd.to_numeric(df[target], errors="coerce")
+        mask = x.notna() & y.notna()
+        n = int(mask.sum())
+        if n < 3:
+            continue
+        rho, p = stats.spearmanr(x[mask], y[mask])
+        if pd.notna(rho) and pd.notna(p):
+            out[col] = {"rho": float(rho), "p": float(p), "n": n}
+    return out
+
+
+def _correlations(daily_metrics: pd.DataFrame, mood_daily: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     merged = daily_metrics.merge(mood_daily, on="calendarDate", how="inner")
     if merged.empty:
         return {}
@@ -20,13 +39,10 @@ def _correlations(daily_metrics: pd.DataFrame, mood_daily: pd.DataFrame) -> Dict
         "stress_mean",
         "body_battery_delta",
         "active_minutes",
+        "moderate_minutes",
+        "stress_load",
     ]
-    subset = merged[["mood_mean"] + cols].apply(pd.to_numeric, errors="coerce")
-    corr = subset.corr().get("mood_mean")
-    if corr is None:
-        return {}
-    corr = corr.drop(index="mood_mean", errors="ignore")
-    return {k: v for k, v in corr.items() if pd.notna(v)}
+    return _corr_stats(merged, cols)
 
 
 def _weekday_profile(mood_daily: pd.DataFrame) -> Optional[pd.Series]:
@@ -35,6 +51,63 @@ def _weekday_profile(mood_daily: pd.DataFrame) -> Optional[pd.Series]:
     mood_daily = mood_daily.copy()
     mood_daily["weekday"] = pd.to_datetime(mood_daily["calendarDate"]).dt.day_name()
     return mood_daily.groupby("weekday")["mood_mean"].mean().sort_index()
+
+
+def _lagged_correlations(daily_metrics: pd.DataFrame, mood_daily: pd.DataFrame, lag_days: int = 1) -> Dict[str, Dict[str, float]]:
+    if daily_metrics.empty or mood_daily.empty:
+        return {}
+    dm = daily_metrics.copy()
+    md = mood_daily.copy()
+    md["target_date"] = pd.to_datetime(md["calendarDate"])  # mood day
+    dm["target_date"] = pd.to_datetime(dm["calendarDate"]) + pd.Timedelta(days=lag_days)  # metrics shifted forward so they match next-day mood
+    merged = md.merge(dm, on="target_date", suffixes=("_mood", ""))
+    cols = [
+        "steps_total",
+        "active_minutes",
+        "moderate_minutes",
+        "stress_mean",
+        "stress_load",
+        "sleep_hours",
+        "body_battery_am",
+        "body_battery_delta",
+    ]
+    return _corr_stats(merged, cols)
+
+
+def _per_day_slope(dates: pd.Series, values: pd.Series) -> Optional[float]:
+    # Linear slope of value per day; small sample guard
+    ser = pd.to_numeric(values, errors="coerce")
+    ts = pd.to_datetime(dates, errors="coerce")
+    mask = ser.notna() & ts.notna()
+    if mask.sum() < 3:
+        return None
+    x = ts[mask].map(pd.Timestamp.toordinal).astype(float)
+    y = ser[mask].astype(float)
+    try:
+        slope = np.polyfit(x, y, 1)[0]
+    except Exception:
+        return None
+    return float(slope)
+
+
+def _recent_change(dates: pd.Series, values: pd.Series, window_days: int = 14) -> Optional[float]:
+    # Mean difference between last window_days and the prior window_days
+    ser = pd.to_numeric(values, errors="coerce")
+    ts = pd.to_datetime(dates, errors="coerce")
+    mask = ser.notna() & ts.notna()
+    if mask.sum() < 6:
+        return None
+    df = pd.DataFrame({"date": ts[mask], "value": ser[mask]}).sort_values("date")
+    max_date = df["date"].max()
+    if pd.isna(max_date):
+        return None
+    recent_start = max_date - pd.Timedelta(days=window_days)
+    prior_start = max_date - pd.Timedelta(days=2 * window_days)
+    recent = df.loc[df["date"] > recent_start, "value"]
+    prior = df.loc[(df["date"] > prior_start) & (df["date"] <= recent_start), "value"]
+    if len(recent) < 3 or len(prior) < 3:
+        return None
+    return float(recent.mean() - prior.mean())
 
 
 def run_analysis(
@@ -61,10 +134,39 @@ def run_analysis(
             daily_metrics["sleep_minutes"] = daily_metrics["sleep_hours"] * 60
             daily_metrics = daily_metrics.reset_index()
 
+    # Add sleep stage percentages when present in daily summary
+    if not daily_raw.empty and {"deepSleepSeconds", "lightSleepSeconds", "remSleepSeconds"}.issubset(set(daily_raw.columns)):
+        stages = daily_raw.set_index("calendarDate")[["deepSleepSeconds", "lightSleepSeconds", "remSleepSeconds", "sleepingSeconds"]]
+        stages = stages.replace({0: pd.NA})
+        for col in ["deepSleepSeconds", "lightSleepSeconds", "remSleepSeconds", "sleepingSeconds"]:
+            stages[col] = pd.to_numeric(stages[col], errors="coerce")
+        stages["deep_pct"] = stages["deepSleepSeconds"] / stages["sleepingSeconds"] * 100
+        stages["rem_pct"] = stages["remSleepSeconds"] / stages["sleepingSeconds"] * 100
+        stages["light_pct"] = stages["lightSleepSeconds"] / stages["sleepingSeconds"] * 100
+        daily_metrics = daily_metrics.set_index("calendarDate").join(stages[["deep_pct", "rem_pct", "light_pct"]], how="left").reset_index()
+
     sleep_by_date = {row.calendarDate: row.sleep_hours for row in daily_metrics.itertuples()}
     mood_daily = aggregate_mood_daily(mood_df)
     mood_events = enrich_mood_events(df_ts, mood_df, sleep_by_date=sleep_by_date)
     mood_days = daily_metrics.merge(mood_daily, on="calendarDate", how="inner").shape[0]
+    lag_corr = _lagged_correlations(daily_metrics, mood_daily, lag_days=1)
+
+    # Context slices from mood events
+    social_summary = {}
+    env_summary = {}
+    if not mood_events.empty:
+        social_summary = (
+            mood_events.groupby("social_context")
+            .agg(mood_mean=("mood", "mean"), stress_3h_mean=("stress_3h_mean", "mean"), n=("id", "count"))
+            .dropna(how="all")
+            .to_dict(orient="index")
+        )
+        env_summary = (
+            mood_events.groupby("environment_context")
+            .agg(mood_mean=("mood", "mean"), stress_3h_mean=("stress_3h_mean", "mean"), n=("id", "count"))
+            .dropna(how="all")
+            .to_dict(orient="index")
+        )
 
     plot_dir = output_dir / "plots"
     plot_paths = generate_all_plots(daily_metrics, mood_daily, mood_events, output_dir=plot_dir)
@@ -76,6 +178,11 @@ def run_analysis(
         "stress_mean",
         "heart_rate_mean",
         "body_battery_delta",
+        "moderate_minutes",
+        "stress_load",
+        "deep_pct",
+        "rem_pct",
+        "light_pct",
     ]
     coverage = {}
     for col in key_cols:
@@ -110,18 +217,54 @@ def run_analysis(
     weekday_profile = _weekday_profile(mood_daily)
     period_start = str(df_ts.index.min().date()) if not df_ts.empty else "n/a"
     period_end = str(df_ts.index.max().date()) if not df_ts.empty else "n/a"
+    recent_window = 14
+
+    trend_slopes: Dict[str, float] = {}
+    recent_change: Dict[str, float] = {}
+
+    if not daily_metrics.empty:
+        dm_sorted = daily_metrics.sort_values("calendarDate")
+        for col in [
+            "steps_total",
+            "sleep_hours",
+            "stress_mean",
+            "stress_load",
+            "moderate_minutes",
+            "body_battery_delta",
+        ]:
+            if col in dm_sorted:
+                slope = _per_day_slope(dm_sorted["calendarDate"], dm_sorted[col])
+                if slope is not None:
+                    trend_slopes[col] = slope
+                delta = _recent_change(dm_sorted["calendarDate"], dm_sorted[col], window_days=recent_window)
+                if delta is not None:
+                    recent_change[col] = delta
+
+    if not mood_daily.empty:
+        slope = _per_day_slope(mood_daily["calendarDate"], mood_daily["mood_mean"])
+        if slope is not None:
+            trend_slopes["mood_mean"] = slope
+        delta = _recent_change(mood_daily["calendarDate"], mood_daily["mood_mean"], window_days=recent_window)
+        if delta is not None:
+            recent_change["mood_mean"] = delta
     insight = {
         "rows": len(df_ts),
         "days": daily_metrics.shape[0],
         "mood_entries": mood_df.shape[0],
         "plots": [str(p) for p in plot_paths],
         "correlations": _correlations(daily_metrics, mood_daily),
+        "lagged_corr": lag_corr,
         "weekday_profile": weekday_profile.to_dict() if weekday_profile is not None else {},
         "stats": stats,
         "variance_days": variance_days,
         "period": (period_start, period_end),
         "mood_days": mood_days,
         "coverage": coverage,
+        "social_summary": social_summary,
+        "env_summary": env_summary,
+        "trend_slopes": trend_slopes,
+        "recent_change": recent_change,
+        "recent_window": recent_window,
     }
 
     metric_labels = {
@@ -131,6 +274,13 @@ def run_analysis(
         "heart_rate_mean": "mean daily heart rate",
         "body_battery_delta": "change from first to last body battery reading that day (positive = recharged)",
         "active_minutes": "minutes with >=30 steps per minute",
+        "moderate_minutes": "minutes with 60-99 steps per minute",
+        "stress_load": "sum of stress above 25 (per-day load)",
+        "body_battery_am": "first body battery reading of the day",
+        "deep_pct": "deep sleep as % of sleep",
+        "rem_pct": "REM sleep as % of sleep",
+        "light_pct": "light sleep as % of sleep",
+        "mood_mean": "average mood (1-5)",
     }
 
     summary_lines: List[str] = [
@@ -164,12 +314,72 @@ def run_analysis(
         summary_lines.append("Relationships between daily metrics and mood on the days with mood entries.")
         summary_lines.append("")
         summary_lines.append(f"Based on {mood_days} days with mood entries.")
-        summary_lines.append("Positive: higher metric aligns with better mood; negative: higher metric aligns with worse mood.")
-        summary_lines.append("Magnitude guide: ~0.1 weak, ~0.3 moderate, >0.5 strong (small sample; interpret cautiously).")
+        summary_lines.append("Spearman rho with two-sided p-values (uncorrected). Positive: higher metric aligns with better mood; negative: higher metric aligns with worse mood. Magnitude guide: ~0.1 weak, ~0.3 moderate, >0.5 strong (small sample; interpret cautiously).")
         summary_lines.append("")
-        for k, v in insight["correlations"].items():
+        for k, vals in insight["correlations"].items():
             label = metric_labels.get(k, k)
-            summary_lines.append(f"- {k}: {v:.2f} ({label})")
+            rho = vals.get("rho")
+            p = vals.get("p")
+            n = vals.get("n")
+            summary_lines.append(f"- {k}: rho={rho:.2f}, p={p:.3f}, n={n} ({label})")
+
+    if insight.get("lagged_corr"):
+        summary_lines.append("")
+        summary_lines.append("## Next-day mood correlations (lagged 1 day)")
+        summary_lines.append("")
+        summary_lines.append("How yesterday's metrics relate to today's mood (same magnitude guidance; small sample). Spearman rho with p-values.")
+        summary_lines.append("")
+        for k, vals in insight["lagged_corr"].items():
+            label = metric_labels.get(k, k)
+            rho = vals.get("rho")
+            p = vals.get("p")
+            n = vals.get("n")
+            summary_lines.append(f"- {k}: rho={rho:.2f}, p={p:.3f}, n={n} ({label})")
+
+    if insight.get("recent_change"):
+        window_days = insight.get("recent_window", 14)
+        summary_lines.append("")
+        summary_lines.append(f"## Recent change (last {window_days}d vs prior {window_days}d)")
+        summary_lines.append("")
+        summary_lines.append("Mean difference between the most recent window and the preceding window (positive = higher recently).")
+        summary_lines.append("")
+        for k, v in insight["recent_change"].items():
+            label = metric_labels.get(k, k)
+            summary_lines.append(f"- {k}: {v:+.2f} ({label})")
+
+    if insight.get("trend_slopes"):
+        summary_lines.append("")
+        summary_lines.append("## Trends (per-day slope)")
+        summary_lines.append("")
+        summary_lines.append("Linear slopes across the full period (positive = increasing over time).")
+        summary_lines.append("")
+        for k, v in insight["trend_slopes"].items():
+            label = metric_labels.get(k, k)
+            summary_lines.append(f"- {k}: {v:+.4f} per day ({label})")
+
+    if insight.get("social_summary"):
+        summary_lines.append("")
+        summary_lines.append("## Mood by social context")
+        summary_lines.append("")
+        summary_lines.append("Average mood and prior 3h stress grouped by social context at the time of the check-in.")
+        summary_lines.append("")
+        for ctx, vals in insight["social_summary"].items():
+            mood_v = vals.get("mood_mean")
+            stress_v = vals.get("stress_3h_mean")
+            n = vals.get("n")
+            summary_lines.append(f"- {ctx}: mood {mood_v:.2f} | stress_3h {stress_v:.2f} | n={n}")
+
+    if insight.get("env_summary"):
+        summary_lines.append("")
+        summary_lines.append("## Mood by environment")
+        summary_lines.append("")
+        summary_lines.append("Average mood and prior 3h stress grouped by environment context.")
+        summary_lines.append("")
+        for ctx, vals in insight["env_summary"].items():
+            mood_v = vals.get("mood_mean")
+            stress_v = vals.get("stress_3h_mean")
+            n = vals.get("n")
+            summary_lines.append(f"- {ctx}: mood {mood_v:.2f} | stress_3h {stress_v:.2f} | n={n}")
 
     if insight["weekday_profile"]:
         summary_lines.append("")
