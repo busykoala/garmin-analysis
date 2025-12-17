@@ -18,3 +18,13 @@ uv run main.py
 # after this the data extraction will start and then the
 # CSV files will be created
 ```
+
+## Analysis (steps, HR, stress, mood)
+
+After exporting, run the analysis pipeline to merge the Garmin signals with the `garmin_export/mood_tracker.csv` entries and generate plots:
+
+```bash
+uv run python -m garmin.analysis.report
+```
+
+Outputs are written to `analysis_output/` with PNG plots under `analysis_output/plots/` and a text summary in `analysis_output/summary.txt`.

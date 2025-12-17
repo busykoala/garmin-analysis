@@ -2,6 +2,7 @@ garmin_export
 daily_summary.csv
 df_all.csv
 mood_tracker.csv
+analysis_output
 
 # Python-generated files
 __pycache__/
