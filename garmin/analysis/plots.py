@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -205,7 +205,12 @@ def plot_body_battery_vs_energy(mood_events: pd.DataFrame, output_dir: Path) -> 
     return _save(fig, output_dir, "body_battery_vs_energy")
 
 
-def plot_sleep_vs_next_day_mood(daily_metrics: pd.DataFrame, mood_daily: pd.DataFrame, output_dir: Path) -> Optional[Path]:
+def plot_sleep_vs_next_day_mood(
+    daily_metrics: pd.DataFrame,
+    mood_daily: pd.DataFrame,
+    output_dir: Path,
+    lag_corr: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Optional[Path]:
     if daily_metrics.empty or mood_daily.empty:
         return None
 
@@ -217,7 +222,10 @@ def plot_sleep_vs_next_day_mood(daily_metrics: pd.DataFrame, mood_daily: pd.Data
 
     merged["date"] = pd.to_datetime(merged["calendarDate"])
 
-    corr = merged[["sleep_hours", "mood_mean"]].apply(pd.to_numeric, errors="coerce").corr().iloc[0, 1]
+    perm = _spearman_perm(merged["date"], merged["sleep_hours"], merged["mood_mean"])
+    corr = perm.get("rho") if perm else np.nan
+    p_val = perm.get("p") if perm else np.nan
+    q_val = lag_corr.get("sleep_hours", {}).get("q") if lag_corr else None
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
     ax1.bar(merged["date"], merged["sleep_hours"], color=Palette["purple"], alpha=0.6, label="Sleep (h)")
@@ -231,7 +239,8 @@ def plot_sleep_vs_next_day_mood(daily_metrics: pd.DataFrame, mood_daily: pd.Data
     ax2.tick_params(axis="y", labelcolor=Palette["green"])
     ax2.set_ylim(1, 5)
 
-    corr_txt = f"r = {corr:.2f}" if pd.notna(corr) else "r = n/a"
+    sig_txt = f"q={q_val:.3f}" if q_val is not None else (f"p={p_val:.3f}" if pd.notna(p_val) else "")
+    corr_txt = f"rho={corr:.2f} {sig_txt}" if pd.notna(corr) else "rho = n/a"
     ax1.set_title(f"Prior-night sleep vs. next-day mood ({corr_txt})")
     _format_date_axis(ax1)
 
@@ -362,25 +371,29 @@ def plot_correlation_bars(corr: Dict[str, Dict[str, float]], title: str, output_
     labels = [k for k, _ in items]
     rhos = [v.get("rho") for _, v in items]
     pvals = [v.get("p") for _, v in items]
+    qvals = [v.get("q") for _, v in items]
     palette = [Palette["green"] if r is not None and r >= 0 else Palette["red"] for r in rhos]
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
     # Use hue to avoid seaborn palette deprecation
     sns.barplot(x=rhos, y=labels, hue=labels, palette=palette, ax=ax, orient="h", legend=False)
     xmin, xmax = min(rhos), max(rhos)
-    pad = 0.08
+    pad = 0.15
     ax.set_xlim(xmin - pad, xmax + pad)
     ax.axvline(0, color=Palette["gray"], linewidth=1.2)
-    ax.set_xlabel("Spearman rho")
+    ax.set_xlabel("Spearman rho (significance by q-value)")
     ax.set_title(title)
-    for i, (r, p) in enumerate(zip(rhos, pvals)):
-        marker = _sig_marker(p)
+    for i, (r, p, q) in enumerate(zip(rhos, pvals, qvals)):
+        sig_value = q if q is not None else p
+        marker = _sig_marker(sig_value)
+        sig_label = f"q={q:.3f}" if q is not None else (f"p={p:.3f}" if p is not None else "")
+        x_pos = r + (0.03 if r >= 0 else 0.03)
         ax.text(
-            r + (0.025 if r >= 0 else -0.025),
+            x_pos,
             i,
-            f"{r:.2f} {marker}",
+            f"{r:.2f} {sig_label} {marker}",
             va="center",
-            ha="left" if r >= 0 else "right",
+            ha="left",
             fontsize=9,
             clip_on=False,
         )
@@ -425,7 +438,8 @@ def plot_context_bars(mood_events: pd.DataFrame, context_col: str, title: str, n
     ax2.set_ylabel("Stress (prior 3h)")
     ax1.set_title(title)
     for i, v in enumerate(grouped["mood_mean"]):
-        ax1.text(i, v + 0.05, f"{v:.2f}", ha="center", va="bottom", fontsize=8)
+        count = grouped.iloc[i]["count"]
+        ax1.text(i, v + 0.05, f"{v:.2f} (n={int(count)})", ha="center", va="bottom", fontsize=8)
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
@@ -468,24 +482,254 @@ def plot_metric_coverage(daily_metrics: pd.DataFrame, output_dir: Path) -> Optio
     return _save(fig, output_dir, "metric_coverage")
 
 
-def _corr_stats(df: pd.DataFrame, cols: List[str], target: str = "mood_mean") -> Dict[str, Dict[str, float]]:
+def plot_recent_change_bars(recent_change: Dict[str, Dict[str, float]], metric_labels: Dict[str, str], output_dir: Path) -> Optional[Path]:
+    if not recent_change:
+        return None
+    items = []
+    for k, v in recent_change.items():
+        delta = v.get("delta")
+        ci = v.get("ci")
+        if delta is None:
+            continue
+        items.append((k, delta, ci))
+    if not items:
+        return None
+    items.sort(key=lambda t: t[1])
+    labels = [metric_labels.get(k, k) for k, _, _ in items]
+    deltas = [d for _, d, _ in items]
+    cis = [ci for _, _, ci in items]
+    y_pos = np.arange(len(items))
+    fig, ax = plt.subplots(figsize=(9, 5))
+    colors = [Palette["green"] if d >= 0 else Palette["red"] for d in deltas]
+    xerr = None
+    if any(ci is not None for ci in cis):
+        lower = [d - ci[0] if ci else 0 for d, ci in zip(deltas, cis)]
+        upper = [ci[1] - d if ci else 0 for d, ci in zip(deltas, cis)]
+        xerr = [lower, upper]
+    ax.barh(y_pos, deltas, xerr=xerr, color=colors, alpha=0.85, ecolor="#444", capsize=6)
+    ax.axvline(0, color=Palette["gray"], linewidth=1.2)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel("Recent change (last 14d - prior 14d)")
+    ax.set_xscale("symlog", linthresh=50, linscale=1.2)
+    ax.set_title("Recent change with block-bootstrap CI (symlog scale)")
+    sns.despine(ax=ax)
+    return _save(fig, output_dir, "recent_change_bars")
+
+
+def plot_trend_with_ci(daily_metrics: pd.DataFrame, metric: str, label: str, output_dir: Path) -> Optional[Path]:
+    if metric not in daily_metrics.columns or daily_metrics.empty:
+        return None
+    dm = daily_metrics.dropna(subset=[metric]).copy()
+    if dm.shape[0] < 5:
+        return None
+    band = _trend_band(dm["calendarDate"], dm[metric])
+    if band is None:
+        return None
+    dates, fit_line, low, high = band
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(pd.to_datetime(dm["calendarDate"]), dm[metric], color=Palette["blue"], alpha=0.35, label="Daily value")
+    ax.plot(dates, fit_line, color=Palette["red"], linewidth=2.0, label="Trend (linear)")
+    ax.fill_between(dates, low, high, color=Palette["red"], alpha=0.16, label="Trend CI")
+    ax.set_title(f"Trend with CI: {label}")
+    ax.set_ylabel(label)
+    _format_date_axis(ax)
+    ax.legend()
+    return _save(fig, output_dir, f"trend_{metric}")
+
+
+def plot_coverage_heatmap(daily_metrics: pd.DataFrame, metrics: List[str], output_dir: Path) -> Optional[Path]:
+    if daily_metrics.empty:
+        return None
+    df = daily_metrics.copy()
+    df["date"] = pd.to_datetime(df["calendarDate"]).dt.normalize()
+    presence = {}
+    for m in metrics:
+        if m not in df.columns:
+            continue
+        presence[m] = pd.to_numeric(df[m], errors="coerce").notna().astype(int)
+    if not presence:
+        return None
+    mat = pd.DataFrame(presence)
+    mat["date"] = df["date"].values
+    mat = mat.set_index("date").sort_index()
+    mat = mat.groupby(mat.index).first()  # collapse duplicates per day
+
+    fig, ax = plt.subplots(figsize=(12, 4.5 + len(presence) * 0.2))
+    cmap = sns.color_palette(["#e5e5e5", Palette["blue"]], as_cmap=True)
+    sns.heatmap(mat.T, cmap=cmap, vmin=0, vmax=1, cbar=False, ax=ax, linewidths=0.4, linecolor="#d8dee4")
+    ax.set_title("Metric availability by date (1 = present, 0 = missing)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Metric")
+
+    # Reduce x tick density to weekly labels
+    dates = mat.index.to_list()
+    if dates:
+        step = max(1, len(dates) // 10)
+        xticks = np.arange(0, len(dates), step)
+        ax.set_xticks(xticks + 0.5)
+        ax.set_xticklabels([dates[i].strftime("%b %d") for i in xticks], rotation=35, ha="right")
+    return _save(fig, output_dir, "metric_coverage_heatmap")
+
+
+def _block_indices(n: int, block_size: int = 2) -> List[np.ndarray]:
+    idx = np.arange(n)
+    return [idx[i : i + block_size] for i in range(0, n, block_size)]
+
+
+def _spearman_perm(dates: pd.Series, x: pd.Series, y: pd.Series, n_perm: int = 1000, block_size: int = 2) -> Optional[Dict[str, float]]:
+    df = pd.DataFrame({"date": pd.to_datetime(dates, errors="coerce"), "x": pd.to_numeric(x, errors="coerce"), "y": pd.to_numeric(y, errors="coerce")}).dropna()
+    if df.shape[0] < 3:
+        return None
+    df = df.sort_values("date").reset_index(drop=True)
+    n = df.shape[0]
+    rho_obs, _ = stats.spearmanr(df["x"], df["y"])
+    if pd.isna(rho_obs):
+        return None
+    blocks = _block_indices(n, block_size=block_size)
+    perm_stats = 0
+    for _ in range(n_perm):
+        order = np.random.permutation(len(blocks))
+        perm_idx = np.concatenate([blocks[i] for i in order])
+        rho_perm, _ = stats.spearmanr(df.loc[perm_idx, "x"], df["y"])
+        if pd.notna(rho_perm) and abs(rho_perm) >= abs(rho_obs):
+            perm_stats += 1
+    p_perm = (perm_stats + 1) / (n_perm + 1)
+    return {"rho": float(rho_obs), "p": float(p_perm), "n": int(n)}
+
+
+def _bh_correction(results: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    p_items = [(k, v.get("p")) for k, v in results.items() if v and v.get("p") is not None]
+    m = len(p_items)
+    if m == 0:
+        return {}
+    p_sorted = sorted(p_items, key=lambda kv: kv[1])
+    q_map: Dict[str, float] = {}
+    for rank, (k, p) in enumerate(p_sorted, start=1):
+        q = p * m / rank
+        q_map[k] = min(q, 1.0)
+    for i in range(m - 2, -1, -1):
+        k, _ = p_sorted[i]
+        k_next, _ = p_sorted[i + 1]
+        q_map[k] = min(q_map[k], q_map[k_next])
+    return q_map
+
+
+def _block_bootstrap_ci(
+    dates: pd.Series,
+    values: pd.Series,
+    stat_fn,
+    n_boot: int = 400,
+    block_size: int = 2,
+    alpha: float = 0.05,
+) -> Optional[Tuple[float, float]]:
+    df = pd.DataFrame({"date": pd.to_datetime(dates, errors="coerce"), "value": pd.to_numeric(values, errors="coerce")}).dropna()
+    if df.shape[0] < block_size + 1:
+        return None
+    df = df.sort_values("date").reset_index(drop=True)
+    n = df.shape[0]
+    blocks = _block_indices(n, block_size=block_size)
+    samples: List[float] = []
+    for _ in range(n_boot):
+        order = np.random.randint(0, len(blocks), size=len(blocks))
+        idx = np.concatenate([blocks[i] for i in order])[:n]
+        boot_df = df.loc[idx].reset_index(drop=True)
+        stat_val = stat_fn(boot_df["date"], boot_df["value"])
+        if stat_val is not None and not pd.isna(stat_val):
+            samples.append(float(stat_val))
+    if len(samples) < max(30, int(0.3 * n_boot)):
+        return None
+    low, high = np.percentile(samples, [alpha / 2 * 100, (1 - alpha / 2) * 100])
+    return float(low), float(high)
+
+
+def _per_day_slope(dates: pd.Series, values: pd.Series) -> Optional[float]:
+    ser = pd.to_numeric(values, errors="coerce")
+    ts = pd.to_datetime(dates, errors="coerce")
+    mask = ser.notna() & ts.notna()
+    if mask.sum() < 3:
+        return None
+    x = ts[mask].map(pd.Timestamp.toordinal).astype(float)
+    y = ser[mask].astype(float)
+    try:
+        slope = np.polyfit(x, y, 1)[0]
+    except Exception:
+        return None
+    return float(slope)
+
+
+def _recent_change(dates: pd.Series, values: pd.Series, window_days: int = 14) -> Optional[float]:
+    ser = pd.to_numeric(values, errors="coerce")
+    ts = pd.to_datetime(dates, errors="coerce")
+    mask = ser.notna() & ts.notna()
+    if mask.sum() < 6:
+        return None
+    df = pd.DataFrame({"date": ts[mask], "value": ser[mask]}).sort_values("date")
+    max_date = df["date"].max()
+    if pd.isna(max_date):
+        return None
+    recent_start = max_date - pd.Timedelta(days=window_days)
+    prior_start = max_date - pd.Timedelta(days=2 * window_days)
+    recent = df.loc[df["date"] > recent_start, "value"]
+    prior = df.loc[(df["date"] > prior_start) & (df["date"] <= recent_start), "value"]
+    if len(recent) < 3 or len(prior) < 3:
+        return None
+    return float(recent.mean() - prior.mean())
+
+
+def _trend_band(
+    dates: pd.Series,
+    values: pd.Series,
+    n_boot: int = 400,
+    block_size: int = 2,
+    alpha: float = 0.05,
+) -> Optional[Tuple[pd.Series, np.ndarray, np.ndarray, np.ndarray]]:
+    df = pd.DataFrame({"date": pd.to_datetime(dates, errors="coerce"), "value": pd.to_numeric(values, errors="coerce")}).dropna()
+    if df.shape[0] < 5:
+        return None
+    df = df.sort_values("date").reset_index(drop=True)
+    x = mdates.date2num(df["date"])
+    y = df["value"].to_numpy(dtype=float)
+    try:
+        coeffs = np.polyfit(x, y, 1)
+    except Exception:
+        return None
+    fit_line = np.poly1d(coeffs)(x)
+    blocks = _block_indices(len(df), block_size=block_size)
+    preds = []
+    for _ in range(n_boot):
+        order = np.random.randint(0, len(blocks), size=len(blocks))
+        idx = np.concatenate([blocks[i] for i in order])[: len(df)]
+        boot = df.iloc[idx].reset_index(drop=True)
+        bx = mdates.date2num(boot["date"])
+        by = boot["value"].to_numpy(dtype=float)
+        if len(np.unique(bx)) < 2:
+            continue
+        try:
+            bcoeffs = np.polyfit(bx, by, 1)
+        except Exception:
+            continue
+        preds.append(np.poly1d(bcoeffs)(x))
+    if len(preds) < max(30, int(0.3 * n_boot)):
+        return None
+    pred_arr = np.vstack(preds)
+    low = np.percentile(pred_arr, alpha / 2 * 100, axis=0)
+    high = np.percentile(pred_arr, (1 - alpha / 2) * 100, axis=0)
+    return df["date"], fit_line, low, high
+
+
+def _corr_stats(df: pd.DataFrame, cols: List[str], target: str = "mood_mean", date_col: str = "calendarDate") -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {}
     for col in cols:
-        if col not in df.columns:
+        if col not in df.columns or date_col not in df.columns:
             continue
-        x = pd.to_numeric(df[col], errors="coerce")
-        y = pd.to_numeric(df[target], errors="coerce")
-        mask = x.notna() & y.notna()
-        n = int(mask.sum())
-        if n < 3:
-            continue
-        rho, p = stats.spearmanr(x[mask], y[mask])
-        if pd.notna(rho) and pd.notna(p):
-            out[col] = {"rho": float(rho), "p": float(p), "n": n}
+        res = _spearman_perm(df[date_col], df[col], df[target])
+        if res:
+            out[col] = res
     return out
 
 
-def _corr_daily(daily_metrics: pd.DataFrame, mood_daily: pd.DataFrame) -> Dict[str, float]:
+def _corr_daily(daily_metrics: pd.DataFrame, mood_daily: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     if daily_metrics.empty or mood_daily.empty:
         return {}
     merged = daily_metrics.merge(mood_daily, on="calendarDate", how="inner")
@@ -498,10 +742,10 @@ def _corr_daily(daily_metrics: pd.DataFrame, mood_daily: pd.DataFrame) -> Dict[s
         "moderate_minutes",
         "stress_load",
     ]
-    return _corr_stats(merged, cols)
+    return _corr_stats(merged, cols, date_col="calendarDate")
 
 
-def _lagged_corr(daily_metrics: pd.DataFrame, mood_daily: pd.DataFrame, lag_days: int = 1) -> Dict[str, float]:
+def _lagged_corr(daily_metrics: pd.DataFrame, mood_daily: pd.DataFrame, lag_days: int = 1) -> Dict[str, Dict[str, float]]:
     if daily_metrics.empty or mood_daily.empty:
         return {}
     dm = daily_metrics.copy()
@@ -519,7 +763,7 @@ def _lagged_corr(daily_metrics: pd.DataFrame, mood_daily: pd.DataFrame, lag_days
         "body_battery_am",
         "body_battery_delta",
     ]
-    return _corr_stats(merged, cols)
+    return _corr_stats(merged, cols, date_col="target_date")
 
 
 def generate_all_plots(
@@ -531,11 +775,59 @@ def generate_all_plots(
     output_dir = Path(output_dir)
     corr = _corr_daily(daily_metrics, mood_daily)
     lag_corr = _lagged_corr(daily_metrics, mood_daily, lag_days=1)
+    combined = {f"same_{k}": v for k, v in corr.items()}
+    combined.update({f"lag_{k}": v for k, v in lag_corr.items()})
+    q_map = _bh_correction(combined)
+    for k, v in corr.items():
+        if v:
+            v["q"] = q_map.get(f"same_{k}")
+    for k, v in lag_corr.items():
+        if v:
+            v["q"] = q_map.get(f"lag_{k}")
+
+    metric_labels = {
+        "steps_total": "Total steps per day",
+        "sleep_hours": "Sleep duration (h)",
+        "stress_mean": "Average daily stress",
+        "heart_rate_mean": "Mean daily heart rate",
+        "body_battery_delta": "Body battery Δ",
+        "active_minutes": "Active minutes",
+        "moderate_minutes": "Moderate minutes",
+        "stress_load": "Stress load",
+        "body_battery_am": "Body battery AM",
+        "mood_mean": "Mean mood (1-5)",
+    }
+
+    # Recent change and trend for selected metrics
+    recent_change: Dict[str, Dict[str, float]] = {}
+    trend_metrics = [
+        "sleep_hours",
+        "stress_mean",
+        "steps_total",
+        "body_battery_delta",
+    ]
+    if not daily_metrics.empty:
+        dm_sorted = daily_metrics.sort_values("calendarDate")
+        for col in trend_metrics:
+            if col in dm_sorted:
+                delta = _recent_change(dm_sorted["calendarDate"], dm_sorted[col], window_days=14)
+                ci_delta = _block_bootstrap_ci(dm_sorted["calendarDate"], dm_sorted[col], lambda d, v: _recent_change(d, v, window_days=14))
+                if delta is not None:
+                    recent_change[col] = {"delta": delta}
+                    if ci_delta:
+                        recent_change[col]["ci"] = ci_delta
+
+    # Trend plots use bootstrap bands
+    trend_plots = [
+        plot_trend_with_ci(daily_metrics, "sleep_hours", metric_labels["sleep_hours"], output_dir),
+        plot_trend_with_ci(daily_metrics, "stress_mean", metric_labels["stress_mean"], output_dir),
+        plot_trend_with_ci(daily_metrics, "steps_total", metric_labels["steps_total"], output_dir),
+    ]
 
     plots: List[Optional[Path]] = [
         plot_daily_steps_and_mood(daily_metrics, mood_daily, output_dir),
         plot_rolling_stress_and_mood(daily_metrics, mood_daily, output_dir),
-        plot_sleep_vs_next_day_mood(daily_metrics, mood_daily, output_dir),
+        plot_sleep_vs_next_day_mood(daily_metrics, mood_daily, output_dir, lag_corr=lag_corr),
         plot_body_battery_vs_energy(mood_events, output_dir),
         plot_event_stress_vs_mood(mood_events, output_dir),
         plot_health_overview(daily_metrics, output_dir),
@@ -545,5 +837,8 @@ def generate_all_plots(
         plot_metric_coverage(daily_metrics, output_dir),
         plot_context_bars(mood_events, "social_context", "Mood by social context", "mood_by_social", output_dir),
         plot_context_bars(mood_events, "environment_context", "Mood by environment", "mood_by_environment", output_dir),
+        plot_recent_change_bars(recent_change, metric_labels, output_dir),
+        plot_coverage_heatmap(daily_metrics, list(metric_labels.keys()), output_dir),
     ]
+    plots.extend(trend_plots)
     return [p for p in plots if p is not None]

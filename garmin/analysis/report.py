@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,20 +12,14 @@ from .features import aggregate_mood_daily, compute_daily_metrics, enrich_mood_e
 from .plots import generate_all_plots
 
 
-def _corr_stats(df: pd.DataFrame, cols: List[str], target: str = "mood_mean") -> Dict[str, Dict[str, float]]:
+def _corr_stats(df: pd.DataFrame, cols: List[str], target: str = "mood_mean", date_col: str = "calendarDate") -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {}
     for col in cols:
-        if col not in df.columns:
+        if col not in df.columns or date_col not in df.columns:
             continue
-        x = pd.to_numeric(df[col], errors="coerce")
-        y = pd.to_numeric(df[target], errors="coerce")
-        mask = x.notna() & y.notna()
-        n = int(mask.sum())
-        if n < 3:
-            continue
-        rho, p = stats.spearmanr(x[mask], y[mask])
-        if pd.notna(rho) and pd.notna(p):
-            out[col] = {"rho": float(rho), "p": float(p), "n": n}
+        res = _spearman_perm(df[date_col], df[col], df[target])
+        if res:
+            out[col] = res
     return out
 
 
@@ -42,7 +36,7 @@ def _correlations(daily_metrics: pd.DataFrame, mood_daily: pd.DataFrame) -> Dict
         "moderate_minutes",
         "stress_load",
     ]
-    return _corr_stats(merged, cols)
+    return _corr_stats(merged, cols, date_col="calendarDate")
 
 
 def _weekday_profile(mood_daily: pd.DataFrame) -> Optional[pd.Series]:
@@ -71,7 +65,7 @@ def _lagged_correlations(daily_metrics: pd.DataFrame, mood_daily: pd.DataFrame, 
         "body_battery_am",
         "body_battery_delta",
     ]
-    return _corr_stats(merged, cols)
+    return _corr_stats(merged, cols, date_col="target_date")
 
 
 def _per_day_slope(dates: pd.Series, values: pd.Series) -> Optional[float]:
@@ -108,6 +102,78 @@ def _recent_change(dates: pd.Series, values: pd.Series, window_days: int = 14) -
     if len(recent) < 3 or len(prior) < 3:
         return None
     return float(recent.mean() - prior.mean())
+
+
+def _block_indices(n: int, block_size: int = 2) -> List[np.ndarray]:
+    idx = np.arange(n)
+    return [idx[i : i + block_size] for i in range(0, n, block_size)]
+
+
+def _spearman_perm(dates: pd.Series, x: pd.Series, y: pd.Series, n_perm: int = 1000, block_size: int = 2) -> Optional[Dict[str, float]]:
+    df = pd.DataFrame({"date": pd.to_datetime(dates, errors="coerce"), "x": pd.to_numeric(x, errors="coerce"), "y": pd.to_numeric(y, errors="coerce")}).dropna()
+    if df.shape[0] < 3:
+        return None
+    df = df.sort_values("date").reset_index(drop=True)
+    n = df.shape[0]
+    rho_obs, _ = stats.spearmanr(df["x"], df["y"])
+    if pd.isna(rho_obs):
+        return None
+    blocks = _block_indices(n, block_size=block_size)
+    perm_stats = 0
+    for _ in range(n_perm):
+        order = np.random.permutation(len(blocks))
+        perm_idx = np.concatenate([blocks[i] for i in order])
+        rho_perm, _ = stats.spearmanr(df.loc[perm_idx, "x"], df["y"])
+        if pd.notna(rho_perm) and abs(rho_perm) >= abs(rho_obs):
+            perm_stats += 1
+    p_perm = (perm_stats + 1) / (n_perm + 1)
+    return {"rho": float(rho_obs), "p": float(p_perm), "n": int(n)}
+
+
+def _bh_correction(results: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    p_items = [(k, v.get("p")) for k, v in results.items() if v and v.get("p") is not None]
+    m = len(p_items)
+    if m == 0:
+        return {}
+    p_sorted = sorted(p_items, key=lambda kv: kv[1])
+    q_map: Dict[str, float] = {}
+    for rank, (k, p) in enumerate(p_sorted, start=1):
+        q = p * m / rank
+        q_map[k] = min(q, 1.0)
+    # ensure monotonicity from largest p
+    for i in range(m - 2, -1, -1):
+        k, _ = p_sorted[i]
+        k_next, _ = p_sorted[i + 1]
+        q_map[k] = min(q_map[k], q_map[k_next])
+    return q_map
+
+
+def _block_bootstrap_ci(
+    dates: pd.Series,
+    values: pd.Series,
+    stat_fn,
+    n_boot: int = 400,
+    block_size: int = 2,
+    alpha: float = 0.05,
+) -> Optional[Tuple[float, float]]:
+    df = pd.DataFrame({"date": pd.to_datetime(dates, errors="coerce"), "value": pd.to_numeric(values, errors="coerce")}).dropna()
+    if df.shape[0] < block_size + 1:
+        return None
+    df = df.sort_values("date").reset_index(drop=True)
+    n = df.shape[0]
+    blocks = _block_indices(n, block_size=block_size)
+    stats_samples: List[float] = []
+    for _ in range(n_boot):
+        order = np.random.randint(0, len(blocks), size=len(blocks))
+        idx = np.concatenate([blocks[i] for i in order])[:n]
+        boot_df = df.loc[idx].reset_index(drop=True)
+        stat_val = stat_fn(boot_df["date"], boot_df["value"])
+        if stat_val is not None and not pd.isna(stat_val):
+            stats_samples.append(float(stat_val))
+    if len(stats_samples) < max(30, int(0.3 * n_boot)):
+        return None
+    low, high = np.percentile(stats_samples, [alpha / 2 * 100, (1 - alpha / 2) * 100])
+    return float(low), float(high)
 
 
 def run_analysis(
@@ -149,7 +215,19 @@ def run_analysis(
     mood_daily = aggregate_mood_daily(mood_df)
     mood_events = enrich_mood_events(df_ts, mood_df, sleep_by_date=sleep_by_date)
     mood_days = daily_metrics.merge(mood_daily, on="calendarDate", how="inner").shape[0]
+    corr_same_day = _correlations(daily_metrics, mood_daily)
     lag_corr = _lagged_correlations(daily_metrics, mood_daily, lag_days=1)
+
+    # Multiple-comparison correction (BH-FDR) across all mood-metric correlations
+    combined = {f"same_{k}": v for k, v in corr_same_day.items()}
+    combined.update({f"lag_{k}": v for k, v in lag_corr.items()})
+    q_map = _bh_correction(combined)
+    for k, v in corr_same_day.items():
+        if v:
+            v["q"] = q_map.get(f"same_{k}")
+    for k, v in lag_corr.items():
+        if v:
+            v["q"] = q_map.get(f"lag_{k}")
 
     # Context slices from mood events
     social_summary = {}
@@ -219,8 +297,8 @@ def run_analysis(
     period_end = str(df_ts.index.max().date()) if not df_ts.empty else "n/a"
     recent_window = 14
 
-    trend_slopes: Dict[str, float] = {}
-    recent_change: Dict[str, float] = {}
+    trend_slopes: Dict[str, Dict[str, float]] = {}
+    recent_change: Dict[str, Dict[str, float]] = {}
 
     if not daily_metrics.empty:
         dm_sorted = daily_metrics.sort_values("calendarDate")
@@ -234,25 +312,41 @@ def run_analysis(
         ]:
             if col in dm_sorted:
                 slope = _per_day_slope(dm_sorted["calendarDate"], dm_sorted[col])
+                ci_slope = _block_bootstrap_ci(dm_sorted["calendarDate"], dm_sorted[col], _per_day_slope)
                 if slope is not None:
-                    trend_slopes[col] = slope
+                    trend_slopes[col] = {"slope": slope}
+                    if ci_slope:
+                        trend_slopes[col]["ci"] = ci_slope
                 delta = _recent_change(dm_sorted["calendarDate"], dm_sorted[col], window_days=recent_window)
+                ci_delta = _block_bootstrap_ci(
+                    dm_sorted["calendarDate"], dm_sorted[col], lambda d, v: _recent_change(d, v, window_days=recent_window)
+                )
                 if delta is not None:
-                    recent_change[col] = delta
+                    recent_change[col] = {"delta": delta}
+                    if ci_delta:
+                        recent_change[col]["ci"] = ci_delta
 
     if not mood_daily.empty:
         slope = _per_day_slope(mood_daily["calendarDate"], mood_daily["mood_mean"])
+        ci_slope = _block_bootstrap_ci(mood_daily["calendarDate"], mood_daily["mood_mean"], _per_day_slope)
         if slope is not None:
-            trend_slopes["mood_mean"] = slope
+            trend_slopes["mood_mean"] = {"slope": slope}
+            if ci_slope:
+                trend_slopes["mood_mean"]["ci"] = ci_slope
         delta = _recent_change(mood_daily["calendarDate"], mood_daily["mood_mean"], window_days=recent_window)
+        ci_delta = _block_bootstrap_ci(
+            mood_daily["calendarDate"], mood_daily["mood_mean"], lambda d, v: _recent_change(d, v, window_days=recent_window)
+        )
         if delta is not None:
-            recent_change["mood_mean"] = delta
+            recent_change["mood_mean"] = {"delta": delta}
+            if ci_delta:
+                recent_change["mood_mean"]["ci"] = ci_delta
     insight = {
         "rows": len(df_ts),
         "days": daily_metrics.shape[0],
         "mood_entries": mood_df.shape[0],
         "plots": [str(p) for p in plot_paths],
-        "correlations": _correlations(daily_metrics, mood_daily),
+        "correlations": corr_same_day,
         "lagged_corr": lag_corr,
         "weekday_profile": weekday_profile.to_dict() if weekday_profile is not None else {},
         "stats": stats,
@@ -314,48 +408,62 @@ def run_analysis(
         summary_lines.append("Relationships between daily metrics and mood on the days with mood entries.")
         summary_lines.append("")
         summary_lines.append(f"Based on {mood_days} days with mood entries.")
-        summary_lines.append("Spearman rho with two-sided p-values (uncorrected). Positive: higher metric aligns with better mood; negative: higher metric aligns with worse mood. Magnitude guide: ~0.1 weak, ~0.3 moderate, >0.5 strong (small sample; interpret cautiously).")
+        summary_lines.append(
+            "Spearman rho with block-permutation p-values (block=2 days, 1000 draws) and BH-FDR q-values across all correlations. Positive: higher metric aligns with better mood; negative: higher metric aligns with worse mood. Magnitude guide: ~0.1 weak, ~0.3 moderate, >0.5 strong (small sample; interpret cautiously)."
+        )
         summary_lines.append("")
         for k, vals in insight["correlations"].items():
             label = metric_labels.get(k, k)
             rho = vals.get("rho")
             p = vals.get("p")
+            q = vals.get("q")
             n = vals.get("n")
-            summary_lines.append(f"- {k}: rho={rho:.2f}, p={p:.3f}, n={n} ({label})")
+            q_part = f", q={q:.3f}" if q is not None else ""
+            summary_lines.append(f"- {k}: rho={rho:.2f}, p={p:.3f}{q_part}, n={n} ({label})")
 
     if insight.get("lagged_corr"):
         summary_lines.append("")
         summary_lines.append("## Next-day mood correlations (lagged 1 day)")
         summary_lines.append("")
-        summary_lines.append("How yesterday's metrics relate to today's mood (same magnitude guidance; small sample). Spearman rho with p-values.")
+        summary_lines.append(
+            "How yesterday's metrics relate to today's mood (same magnitude guidance; small sample). Spearman rho with block-permutation p-values and BH-FDR q-values (shared correction across all correlations)."
+        )
         summary_lines.append("")
         for k, vals in insight["lagged_corr"].items():
             label = metric_labels.get(k, k)
             rho = vals.get("rho")
             p = vals.get("p")
+            q = vals.get("q")
             n = vals.get("n")
-            summary_lines.append(f"- {k}: rho={rho:.2f}, p={p:.3f}, n={n} ({label})")
+            q_part = f", q={q:.3f}" if q is not None else ""
+            summary_lines.append(f"- {k}: rho={rho:.2f}, p={p:.3f}{q_part}, n={n} ({label})")
 
     if insight.get("recent_change"):
         window_days = insight.get("recent_window", 14)
         summary_lines.append("")
         summary_lines.append(f"## Recent change (last {window_days}d vs prior {window_days}d)")
         summary_lines.append("")
-        summary_lines.append("Mean difference between the most recent window and the preceding window (positive = higher recently).")
+        summary_lines.append("Mean difference between the most recent window and the preceding window (positive = higher recently). Block-bootstrap 95% CI (block=2 days, 400 reps) when available.")
         summary_lines.append("")
         for k, v in insight["recent_change"].items():
             label = metric_labels.get(k, k)
-            summary_lines.append(f"- {k}: {v:+.2f} ({label})")
+            delta = v.get("delta")
+            ci = v.get("ci")
+            ci_part = f" (CI [{ci[0]:+.2f}, {ci[1]:+.2f}])" if ci else ""
+            summary_lines.append(f"- {k}: {delta:+.2f}{ci_part} ({label})")
 
     if insight.get("trend_slopes"):
         summary_lines.append("")
         summary_lines.append("## Trends (per-day slope)")
         summary_lines.append("")
-        summary_lines.append("Linear slopes across the full period (positive = increasing over time).")
+        summary_lines.append("Linear slopes across the full period (positive = increasing over time). Block-bootstrap 95% CI (block=2 days, 400 reps) when available.")
         summary_lines.append("")
         for k, v in insight["trend_slopes"].items():
             label = metric_labels.get(k, k)
-            summary_lines.append(f"- {k}: {v:+.4f} per day ({label})")
+            slope = v.get("slope")
+            ci = v.get("ci")
+            ci_part = f" (CI [{ci[0]:+.4f}, {ci[1]:+.4f}])" if ci else ""
+            summary_lines.append(f"- {k}: {slope:+.4f} per day{ci_part} ({label})")
 
     if insight.get("social_summary"):
         summary_lines.append("")
